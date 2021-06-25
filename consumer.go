@@ -129,6 +129,7 @@ type Consumer struct {
 	lookupdHTTPAddrs   []string
 	lookupdQueryIndex  int
 
+	reconnectWG     sync.WaitGroup
 	wg              sync.WaitGroup
 	runningHandlers int32
 	stopFlag        int32
@@ -136,6 +137,7 @@ type Consumer struct {
 	stopHandler     sync.Once
 	exitHandler     sync.Once
 
+	reconnectStopChan chan int
 	// read from this channel to block until consumer is cleanly stopped
 	StopChan chan int
 	exitChan chan int
@@ -179,8 +181,9 @@ func NewConsumer(topic string, channel string, config *Config) (*Consumer, error
 
 		rng: rand.New(rand.NewSource(time.Now().UnixNano())),
 
-		StopChan: make(chan int),
-		exitChan: make(chan int),
+		reconnectStopChan: make(chan int),
+		StopChan:          make(chan int),
+		exitChan:          make(chan int),
 	}
 
 	// Set default logger for all log levels
@@ -731,9 +734,6 @@ func (r *Consumer) onConnClose(c *Conn) {
 
 	// we were the last one (and stopping)
 	if atomic.LoadInt32(&r.stopFlag) == 1 {
-		if left == 0 {
-			r.stopHandlers()
-		}
 		return
 	}
 
@@ -750,26 +750,34 @@ func (r *Consumer) onConnClose(c *Conn) {
 	} else if reconnect {
 		// there are no lookupd and we still have this nsqd TCP address in our list...
 		// try to reconnect after a bit
+		r.reconnectWG.Add(1)
 		go func(addr string) {
+			defer r.reconnectWG.Done()
+
+			ticker := time.NewTicker(r.config.LookupdPollInterval)
+			defer ticker.Stop()
+
 			for {
 				r.log(LogLevelInfo, "(%s) re-connecting in %s", addr, r.config.LookupdPollInterval)
-				time.Sleep(r.config.LookupdPollInterval)
-				if atomic.LoadInt32(&r.stopFlag) == 1 {
-					break
-				}
-				r.mtx.RLock()
-				reconnect := indexOf(addr, r.nsqdTCPAddrs) >= 0
-				r.mtx.RUnlock()
-				if !reconnect {
-					r.log(LogLevelWarning, "(%s) skipped reconnect after removal...", addr)
+				select {
+				case <-ticker.C:
+					r.mtx.RLock()
+					reconnect := indexOf(addr, r.nsqdTCPAddrs) >= 0
+					r.mtx.RUnlock()
+					if !reconnect {
+						r.log(LogLevelWarning, "(%s) skipped reconnect after removal...", addr)
+						return
+					}
+					err := r.ConnectToNSQD(addr)
+					if err != nil && err != ErrAlreadyConnected {
+						r.log(LogLevelError, "(%s) error connecting to nsqd - %s", addr, err)
+						continue
+					}
+					return
+
+				case <-r.reconnectStopChan:
 					return
 				}
-				err := r.ConnectToNSQD(addr)
-				if err != nil && err != ErrAlreadyConnected {
-					r.log(LogLevelError, "(%s) error connecting to nsqd - %s", addr, err)
-					continue
-				}
-				break
 			}
 		}(c.String())
 	}
@@ -1047,28 +1055,25 @@ func (r *Consumer) Stop() {
 	if !atomic.CompareAndSwapInt32(&r.stopFlag, 0, 1) {
 		return
 	}
+	close(r.reconnectStopChan)
 
 	r.log(LogLevelInfo, "stopping...")
 
-	if len(r.conns()) == 0 {
-		r.stopHandlers()
-	} else {
-		for _, c := range r.conns() {
-			err := c.WriteCommand(StartClose())
-			if err != nil {
-				r.log(LogLevelError, "(%s) error sending CLS - %s", c.String(), err)
-			}
+	for _, c := range r.conns() {
+		err := c.WriteCommand(StartClose())
+		if err != nil {
+			r.log(LogLevelError, "(%s) error sending CLS - %s", c.String(), err)
 		}
-
-		time.AfterFunc(time.Second*30, func() {
-			// if we've waited this long handlers are blocked on processing messages
-			// so we can't just stopHandlers (if any adtl. messages were pending processing
-			// we would cause a panic on channel close)
-			//
-			// instead, we just bypass handler closing and skip to the final exit
-			r.exit()
-		})
 	}
+
+	time.AfterFunc(time.Second*30, func() {
+		// if we've waited this long handlers are blocked on processing messages
+		// so we can't just stopHandlers (if any adtl. messages were pending processing
+		// we would cause a panic on channel close)
+		//
+		// instead, we just bypass handler closing and skip to the final exit
+		r.exit()
+	})
 }
 
 func (r *Consumer) stopHandlers() {
@@ -1159,6 +1164,19 @@ func (r *Consumer) shouldFailMessage(message *Message, handler interface{}) bool
 
 func (r *Consumer) exit() {
 	r.exitHandler.Do(func() {
+		r.reconnectWG.Wait()
+		conns := r.conns()
+		for _, c := range conns {
+			err := c.WriteCommand(StartClose())
+			if err != nil {
+				r.log(LogLevelError, "(%s) error sending CLS - %s", c.String(), err)
+			}
+		}
+		if len(conns) > 0 {
+			time.Sleep(time.Second * 30)
+		}
+
+		r.stopHandlers()
 		close(r.exitChan)
 		r.wg.Wait()
 		close(r.StopChan)
