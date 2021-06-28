@@ -734,6 +734,11 @@ func (r *Consumer) onConnClose(c *Conn) {
 
 	// we were the last one (and stopping)
 	if atomic.LoadInt32(&r.stopFlag) == 1 {
+		_, opened := <-r.reconnectStopChan
+		if left == 0 && !opened {
+			r.stopHandlers()
+		}
+
 		return
 	}
 
